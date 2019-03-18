@@ -11,6 +11,8 @@ rotorThickness = 0.4
 rotorDiameter = 3.4
 # Rotor bearing hole diameter
 rotorBearingHoleDiameter = 1.5875
+# Spacing between opposing rotors
+rotorSpacing = 0.1
 
 # Camshaft cam diameter
 camDiameter = 0.635
@@ -20,7 +22,7 @@ camshaftDiameter = 1
 camshaftScrewHoleDiameter = 0.52
 
 # Ring gear extrude thickness
-ringGearThickness = rotorThickness 
+ringGearThickness = rotorThickness * 2 + rotorSpacing
 # Ring gear outer diameter
 ringGearOuterDiameter = rotorDiameter + 0.5
 # Ring gear margin around nominal rotor diameter
@@ -35,16 +37,24 @@ ringGearPinRadius = rotorDiameter * math.pi / ringGearPins / 4
 eccentricOffset = 0.5 * ringGearPinRadius
 
 # Rotor output hole diameter
-outputHoleDiameter = 0.4
+outputHoleDiameter = 0.55
 # Rotor output hole count
 outputHoleCount = 6
 # Rotor output hole circle diameter
-outputCircleDiameter = (rotorDiameter + rotorBearingHoleDiameter) / 2 - ringGearPinRadius
+outputCircleDiameter = (rotorDiameter + rotorBearingHoleDiameter) / 2 - ringGearPinRadius * 1.5
 
 # Output pin diameter
 outputPinDiameter = outputHoleDiameter - ringGearPinRadius;
+# Output pin reinforcement screw diameter
+outputPinScrewHoleDiameter = 0.28
 # Output body thickness
 outputPlateThickness = 0.3
+
+# Calculated
+rotorRadius = rotorDiameter / 2
+# Maximum allowed distance between spline points
+maxDist = 0.25 * ringGearPinRadius
+minDist = 0.5 * maxDist # Minimum allowed distance between spline points
 
 def getPoint(theta, rMajor, rMinor, e, n):
   psi = math.atan2(math.sin((1 - n) * theta), ((rMajor / (e * n)) - math.cos((1 - n) * theta)))
@@ -55,153 +65,166 @@ def getPoint(theta, rMajor, rMinor, e, n):
 def distance(xa, ya, xb, yb):
   return math.hypot((xa - xb), (ya - yb))
 
+def rotor(design, root, invert, zOffset):
+  newEccentricOffset = eccentricOffset
+  offsetAngle = 0
+  if invert: 
+    newEccentricOffset *= -1
+    offsetAngle = math.pi / rotorLobes
+
+  rotorOcc = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+  rotor = rotorOcc.component
+  rotor.name = 'Rotor'
+
+  planes = rotor.constructionPlanes
+  planeInput = planes.createInput()
+  offsetValue = adsk.core.ValueInput.createByReal(zOffset)
+  planeInput.setByOffset(root.xYConstructionPlane, offsetValue)
+  constructionPlane = planes.add(planeInput)
+
+  sk = rotor.sketches.add(constructionPlane)
+  points = adsk.core.ObjectCollection.create()
+
+  (xs, ys) = getPoint(0, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
+  points.add(adsk.core.Point3D.create(xs, ys, 0))
+
+  et = 2 * math.pi / rotorLobes
+  (xe, ye) = getPoint(et, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
+  x = xs
+  y = ys
+  dist = 0
+  ct = 0
+  dt = math.pi / ringGearPins
+  numPoints = 0
+
+  while ((distance(x, y, xe, ye) > maxDist or ct < et / 2) and ct < et):
+    (xt, yt) = getPoint(ct + dt, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
+    dist = distance(x, y, xt, yt)
+
+    ddt = dt / 2
+    lastTooBig = False
+    lastTooSmall = False
+
+    while (dist > maxDist or dist < minDist):
+      if (dist > maxDist):
+        if (lastTooSmall):
+          ddt /= 2
+
+        lastTooSmall = False
+        lastTooBig = True
+
+        if (ddt > dt / 2):
+          ddt = dt / 2
+
+        dt -= ddt
+
+      elif (dist < minDist):
+        if (lastTooBig):
+          ddt /= 2
+
+        lastTooSmall = True
+        lastTooBig = False
+        dt += ddt
+
+      (xt, yt) = getPoint(ct + dt, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
+      dist = distance(x, y, xt, yt)
+
+    x = xt
+    y = yt
+    points.add(adsk.core.Point3D.create(x, y, 0))
+    numPoints += 1
+    ct += dt
+
+  points.add(adsk.core.Point3D.create(xe, ye, 0))
+  curve = sk.sketchCurves.sketchFittedSplines.add(points)
+
+  lines = sk.sketchCurves.sketchLines
+  line1 = lines.addByTwoPoints(adsk.core.Point3D.create(0, 0, 0), curve.startSketchPoint)
+  line2 = lines.addByTwoPoints(line1.startSketchPoint, curve.endSketchPoint)
+
+  # Extrude
+  prof = sk.profiles.item(0)
+  dist = adsk.core.ValueInput.createByReal(rotorThickness)
+  extrudes = rotor.features.extrudeFeatures
+  extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+
+  # Create component
+  body1 = extrude.bodies.item(0)
+  body1.name = "Rotor"
+  inputEntities = adsk.core.ObjectCollection.create()
+  inputEntities.add(body1)
+
+  # Circular pattern
+  zAxis = rotor.zConstructionAxis
+  circularFeats = rotor.features.circularPatternFeatures
+  circularFeatInput = circularFeats.createInput(inputEntities, zAxis)
+  circularFeatInput.quantity = adsk.core.ValueInput.createByReal(rotorLobes)
+  circularFeatInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
+  circularFeatInput.isSymmetric = True
+  circularFeat = circularFeats.add(circularFeatInput)
+
+  # Combine pattern features
+  ToolBodies = adsk.core.ObjectCollection.create()
+  for b in circularFeat.bodies:
+    ToolBodies.add(b)
+
+  combineInput = rotor.features.combineFeatures.createInput(body1, ToolBodies)
+  combineInput.operation = adsk.fusion.FeatureOperations.JoinFeatureOperation
+  combineInput.isNewComponent = False
+  rotor.features.combineFeatures.add(combineInput)
+
+  # Center bearing hole
+  sk = rotor.sketches.add(constructionPlane)
+  sketchCircles = sk.sketchCurves.sketchCircles
+  sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), rotorBearingHoleDiameter / 2)
+
+  prof = sk.profiles.item(0)
+  dist = adsk.core.ValueInput.createByReal(rotorThickness)
+  extrudes = rotor.features.extrudeFeatures
+  extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.CutFeatureOperation)
+
+  # Output holes
+  sk = rotor.sketches.add(constructionPlane)
+  sketchCircles = sk.sketchCurves.sketchCircles
+  sketchCircles.addByCenterRadius(adsk.core.Point3D.create(math.cos(-offsetAngle + math.pi / 2) * outputCircleDiameter / 2, math.sin(-offsetAngle + math.pi / 2) * outputCircleDiameter / 2, 0),outputHoleDiameter / 2)
+
+  prof = sk.profiles.item(0)
+  dist = adsk.core.ValueInput.createByReal(rotorThickness)
+  extrudes = rotor.features.extrudeFeatures
+  extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.CutFeatureOperation)
+
+  inputEntities = adsk.core.ObjectCollection.create()
+  inputEntities.add(extrude)
+
+  # Circular pattern
+  circularFeats = rotor.features.circularPatternFeatures
+  circularFeatInput = circularFeats.createInput(inputEntities, zAxis)
+  circularFeatInput.quantity = adsk.core.ValueInput.createByReal(outputHoleCount)
+  circularFeatInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
+  circularFeatInput.isSymmetric = True
+  circularFeat = circularFeats.add(circularFeatInput)
+
+  # Offset the rotor to make the ring gear concentric with origin
+  transform = rotorOcc.transform
+  transform.setToRotation(offsetAngle, adsk.core.Vector3D.create(0, 0, 1), adsk.core.Point3D.create(0, 0, 0))
+  transform.translation = adsk.core.Vector3D.create(newEccentricOffset, 0, 0)
+  rotorOcc.transform = transform
+  design.snapshots.add()
+
 def run(context):
   ui = None
 
   try:
-    rotorRadius = rotorDiameter / 2
-    maxDist = 0.25 * ringGearPinRadius  # Maximum allowed distance between points
-    minDist = 0.5 * maxDist # Minimum allowed distance between points
-
     app = adsk.core.Application.get()
     ui = app.userInterface
     des = adsk.fusion.Design.cast(app.activeProduct)
     root = des.rootComponent
 
-    # Section: rotor
-    rotorOcc = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
-    rotor = rotorOcc.component
-    rotor.name = 'Rotor'
-
-    sk = rotor.sketches.add(root.xYConstructionPlane)
-    points = adsk.core.ObjectCollection.create()
-
     ui.messageBox('Ratio: ' + str((ringGearPins - rotorLobes) / rotorLobes))
 
-    (xs, ys) = getPoint(0, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
-    points.add(adsk.core.Point3D.create(xs, ys, 0))
-
-    et = 2 * math.pi / rotorLobes
-    (xe, ye) = getPoint(et, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
-    x = xs
-    y = ys
-    dist = 0
-    ct = 0
-    dt = math.pi / ringGearPins
-    numPoints = 0
-
-    while ((distance(x, y, xe, ye) > maxDist or ct < et / 2) and ct < et):
-      (xt, yt) = getPoint(ct+dt, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
-      dist = distance(x, y, xt, yt)
-
-      ddt = dt / 2
-      lastTooBig = False
-      lastTooSmall = False
-
-      while (dist > maxDist or dist < minDist):
-        if (dist > maxDist):
-          if (lastTooSmall):
-            ddt /= 2
-
-          lastTooSmall = False
-          lastTooBig = True
-
-          if (ddt > dt / 2):
-            ddt = dt / 2
-
-          dt -= ddt
-
-        elif (dist < minDist):
-          if (lastTooBig):
-            ddt /= 2
-
-          lastTooSmall = True
-          lastTooBig = False
-          dt += ddt
-
-        (xt, yt) = getPoint(ct + dt, rotorRadius, ringGearPinRadius, eccentricOffset, ringGearPins)
-        dist = distance(x, y, xt, yt)
-
-      x = xt
-      y = yt
-      points.add(adsk.core.Point3D.create(x, y, 0))
-      numPoints += 1
-      ct += dt
-
-    points.add(adsk.core.Point3D.create(xe, ye, 0))
-    curve = sk.sketchCurves.sketchFittedSplines.add(points)
-
-    lines = sk.sketchCurves.sketchLines
-    line1 = lines.addByTwoPoints(adsk.core.Point3D.create(0, 0, 0), curve.startSketchPoint)
-    line2 = lines.addByTwoPoints(line1.startSketchPoint, curve.endSketchPoint)
-
-    # Extrude
-    prof = sk.profiles.item(0)
-    dist = adsk.core.ValueInput.createByReal(rotorThickness)
-    extrudes = rotor.features.extrudeFeatures
-    extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
-
-    # Create component
-    body1 = extrude.bodies.item(0)
-    body1.name = "Rotor"
-    inputEntities = adsk.core.ObjectCollection.create()
-    inputEntities.add(body1)
-
-    # Circular pattern
-    zAxis = rotor.zConstructionAxis
-    circularFeats = rotor.features.circularPatternFeatures
-    circularFeatInput = circularFeats.createInput(inputEntities, zAxis)
-    circularFeatInput.quantity = adsk.core.ValueInput.createByReal(rotorLobes)
-    circularFeatInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
-    circularFeatInput.isSymmetric = True
-    circularFeat = circularFeats.add(circularFeatInput)
-
-    # Combine pattern features
-    ToolBodies = adsk.core.ObjectCollection.create()
-    for b in circularFeat.bodies:
-      ToolBodies.add(b)
-
-    combineInput = rotor.features.combineFeatures.createInput(body1, ToolBodies)
-    combineInput.operation = adsk.fusion.FeatureOperations.JoinFeatureOperation
-    combineInput.isNewComponent = False
-    rotor.features.combineFeatures.add(combineInput)
-
-    # Center bearing hole
-    sk = rotor.sketches.add(root.xYConstructionPlane)
-    sketchCircles = sk.sketchCurves.sketchCircles
-    sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), rotorBearingHoleDiameter / 2)
-
-    prof = sk.profiles.item(0)
-    dist = adsk.core.ValueInput.createByReal(rotorThickness)
-    extrudes = rotor.features.extrudeFeatures
-    extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.CutFeatureOperation)
-
-    # Output holes
-    sk = rotor.sketches.add(root.xYConstructionPlane)
-    sketchCircles = sk.sketchCurves.sketchCircles
-    sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, outputCircleDiameter / 2, 0), outputHoleDiameter / 2)
-
-    prof = sk.profiles.item(0)
-    dist = adsk.core.ValueInput.createByReal(rotorThickness)
-    extrudes = rotor.features.extrudeFeatures
-    extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.CutFeatureOperation)
-
-    inputEntities = adsk.core.ObjectCollection.create()
-    inputEntities.add(extrude)
-
-    # Circular pattern
-    circularFeats = rotor.features.circularPatternFeatures
-    circularFeatInput = circularFeats.createInput(inputEntities, zAxis)
-    circularFeatInput.quantity = adsk.core.ValueInput.createByReal(outputHoleCount)
-    circularFeatInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
-    circularFeatInput.isSymmetric = True
-    circularFeat = circularFeats.add(circularFeatInput)
-
-    # Offset the rotor to make the ring gear concentric with origin
-    transform = rotorOcc.transform
-    transform.translation = adsk.core.Vector3D.create(eccentricOffset, 0, 0)
-    rotorOcc.transform = transform
-    des.snapshots.add()
+    # Section: rotor
+    rotor(des, root, False, 0)
+    rotor(des, root, True, rotorThickness + rotorSpacing)
 
     # Section: camshaft
     camshaftOcc = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
@@ -230,7 +253,7 @@ def run(context):
     sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, outputCircleDiameter / 2, 0), outputPinDiameter / 2)
 
     prof = sk.profiles.item(0)
-    dist = adsk.core.ValueInput.createByReal(rotorThickness)
+    dist = adsk.core.ValueInput.createByReal(ringGearThickness)
     extrudes = output.features.extrudeFeatures
     extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
 
@@ -255,6 +278,31 @@ def run(context):
     dist = adsk.core.ValueInput.createByReal(-outputPlateThickness)
     extrudes = output.features.extrudeFeatures
     extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.JoinFeatureOperation)
+
+    # Screw holes
+    sk = output.sketches.add(root.xYConstructionPlane)
+    sketchCircles = sk.sketchCurves.sketchCircles
+    sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, outputCircleDiameter / 2, 0), outputPinScrewHoleDiameter / 2)
+
+    prof = sk.profiles.item(0)
+    extrudeInput = extrudes.createInput(prof, adsk.fusion.FeatureOperations.CutFeatureOperation)
+    extentAll = adsk.fusion.ThroughAllExtentDefinition.create()
+    deg0 = adsk.core.ValueInput.createByString('0 deg')
+    extrudeInput.setTwoSidesExtent(extentAll, extentAll, deg0, deg0)
+    extrudes = output.features.extrudeFeatures
+    extrude = extrudes.add(extrudeInput)
+
+    inputEntities = adsk.core.ObjectCollection.create()
+    inputEntities.add(extrude)
+
+    # Circular pattern
+    zAxis = output.zConstructionAxis
+    circularFeats = output.features.circularPatternFeatures
+    circularFeatInput = circularFeats.createInput(inputEntities, zAxis)
+    circularFeatInput.quantity = adsk.core.ValueInput.createByReal(outputHoleCount)
+    circularFeatInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
+    circularFeatInput.isSymmetric = True
+    circularFeat = circularFeats.add(circularFeatInput)
 
     # Section: ring gear
     ringGearOcc = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
@@ -296,6 +344,24 @@ def run(context):
     dist = adsk.core.ValueInput.createByReal(ringGearThickness)
     extrudes = ringGear.features.extrudeFeatures
     extrude = extrudes.addSimple(prof, dist, adsk.fusion.FeatureOperations.JoinFeatureOperation)
+
+    # Fillets - conditional fillet on edges with length matching gear thickness
+    fillets = ringGear.features.filletFeatures
+
+    edgeCollection1 = adsk.core.ObjectCollection.create()
+    faces = ringGear.bRepBodies.item(0).faces
+    for face in faces:
+      for edge in face.edges:
+        if abs(edge.length - ringGearThickness) < 0.005:
+          edgeCollection1.add(edge)
+
+    radius1 = adsk.core.ValueInput.createByReal(ringGearPinRadius)
+    input1 = fillets.createInput()
+    input1.addConstantRadiusEdgeSet(edgeCollection1, radius1, True)
+    input1.isG2 = False
+    input1.isRollingBallCorner = True
+    fillet1 = fillets.add(input1)
+
     return
 
   except:
